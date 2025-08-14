@@ -1,0 +1,4 @@
+ccxt>=4.1.0
+numpy>=1.26.0
+python-dotenv>=1.0.1
+python-telegram-bot>=20.0
