@@ -1,0 +1,21 @@
+pkg update
+pkg install python libjpeg-turbo libcrypt ndk-sysroot clang
+
+pip install ccxt python-telegram-bot python-dotenv
+
+nano .env
+
+python main.py
+
+pkg install tmux
+
+
+Запустите в сессии tmux:
+
+tmux new-session -s bot
+python ваш_файл.py
+# Нажмите Ctrl+B, затем D для отсоединения
+
+Чтобы вернуться к сессии:
+
+tmux attach-session -t bot
