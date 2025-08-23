@@ -29,13 +29,13 @@ BYBIT_API_SECRET = os.getenv('BYBIT_API_SECRET', '')
 
 # Упрощенный список торговых пар для Termux (меньше нагрузка)
 SYMBOLS = {
-    'BTC': 'BTC/USDT:USDT',
+    'SUI': 'SUI/USDT:USDT',
     'ETH': 'ETH/USDT:USDT',
     'BNB': 'BNB/USDT:USDT',
     'SOL': 'SOL/USDT:USDT',
-    'XRP': 'XRP/USDT:USDT',
+    'SEI': 'SEI/USDT:USDT',
     'ADA': 'ADA/USDT:USDT',
-    'DOGE': 'DOGE/USDT:USDT',
+    'JUP': 'JUP/USDT:USDT',
 }
 
 TIMEFRAME = '15m'
