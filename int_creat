@@ -1,0 +1,351 @@
+Вот адаптированный код для Termux с инструкциями по установке:
+
+core.py
+
+```python
+import csv
+import os
+from datetime import datetime, timezone
+import asyncio
+from telegram.constants import ParseMode
+
+STATS_FILE = 'candle_stats.csv'
+MIN_MESSAGE_INTERVAL = 300  # сек
+MIN_PERCENT_CHANGE = 1.67
+
+TIMEFRAMES = {
+    '5m': '5 минут',
+    '15m': '15 минут',
+    '1h': '1 час'
+}
+
+# Упрощенный список символов для Termux
+SYMBOLS = {
+    'BTC': 'BTC/USDT:USDT',
+    'ETH': 'ETH/USDT:USDT',
+    'BNB': 'BNB/USDT:USDT',
+    'SOL': 'SOL/USDT:USDT',
+    'XRP': 'XRP/USDT:USDT',
+    'ADA': 'ADA/USDT:USDT',
+}
+
+message_history = {}
+last_checked_timestamps = {}
+
+def save_candle_stats(candle_data):
+    """Сохраняет свечу в CSV"""
+    file_exists = os.path.exists(STATS_FILE)
+    with open(STATS_FILE, 'a', newline='') as f:
+        writer = csv.writer(f)
+        if not file_exists:
+            writer.writerow(['Symbol', 'Timeframe', 'Timestamp', 'Open', 'High', 'Low', 'Close', 'Change', 'Volume'])
+        writer.writerow([
+            candle_data['symbol'],
+            candle_data['timeframe'],
+            candle_data['timestamp'],
+            candle_data['open'],
+            candle_data['high'],
+            candle_data['low'],
+            candle_data['close'],
+            candle_data['change'],
+            candle_data['volume']
+        ])
+
+def format_candle_message(candle):
+    symbol_name = candle['symbol'].split('/')[0]
+    tf_label = TIMEFRAMES.get(candle['timeframe'], candle['timeframe'])
+    direction = "🟢" if candle['change'] >= 0 else "🔴"
+    return (
+        f"<b>{direction} {symbol_name} {abs(candle['change']):.2f}% ({tf_label})</b>\n"
+        f"┌ Время: <i>{format_time(candle['time'])}</i>\n"
+        f"├ Цена: <b>{candle['close']:.4f}</b>\n"
+        f"├ Объем: {candle['volume']:.2f} USDT\n"
+        f"└ Диапазон: {candle['low']:.4f}-{candle['high']:.4f}"
+    )
+
+def format_time(dt):
+    return dt.strftime('%Y-%m-%d %H:%M UTC')
+
+def is_similar(c1, c2):
+    if not c1 or not c2:
+        return False
+    change_diff = abs(c1['change'] - c2['change']) / max(abs(c1['change']), 1)
+    volume_diff = abs(c1['volume'] - c2['volume']) / max(c1['volume'], 1)
+    return change_diff < 0.2 and volume_diff < 0.3
+
+def is_candle_closed(candle_timestamp, tf_minutes):
+    now = datetime.now(timezone.utc).timestamp() * 1000
+    end_time = candle_timestamp + tf_minutes * 60 * 1000
+    return now > end_time
+
+def get_timeframe_minutes(tf):
+    return int(tf[:-1]) if tf.endswith('m') else int(tf[:-1]) * 60
+
+async def get_significant_candles(exchange, symbol, timeframe):
+    try:
+        # Синхронизация времени для Bybit
+        exchange.load_time_difference()
+        
+        candles = await asyncio.to_thread(exchange.fetch_ohlcv, symbol, timeframe, limit=200)
+        if len(candles) < 2:
+            return []
+        
+        tf_minutes = get_timeframe_minutes(timeframe)
+        found = []
+        
+        for i in range(len(candles) - 1):
+            c = candles[i]
+            timestamp = c[0]
+            
+            if timestamp <= last_checked_timestamps.get(symbol, {}).get(timeframe, 0):
+                continue
+                
+            if not is_candle_closed(timestamp, tf_minutes):
+                continue
+                
+            change = (c[4] - c[1]) / c[1] * 100
+            if abs(change) < MIN_PERCENT_CHANGE:
+                continue
+                
+            data = {
+                'symbol': symbol,
+                'time': datetime.fromtimestamp(timestamp / 1000, timezone.utc),
+                'open': c[1], 'high': c[2], 'low': c[3], 'close': c[4],
+                'change': change,
+                'volume': c[5],
+                'timestamp': timestamp,
+                'timeframe': timeframe
+            }
+            
+            now = datetime.now(timezone.utc)
+            last = message_history.get(symbol, {}).get(timeframe)
+            
+            if last and (now - last['time']).total_seconds() < MIN_MESSAGE_INTERVAL and is_similar(last['candle'], data):
+                continue
+                
+            if symbol not in message_history:
+                message_history[symbol] = {}
+            message_history[symbol][timeframe] = {'time': now, 'candle': data}
+            
+            if symbol not in last_checked_timestamps:
+                last_checked_timestamps[symbol] = {}
+            last_checked_timestamps[symbol][timeframe] = timestamp
+            
+            save_candle_stats(data)
+            found.append(data)
+            
+        return found
+    except Exception as e:
+        print(f"Ошибка для {symbol} {timeframe}: {e}")
+        return []
+
+async def send_message_about_candle(bot, candle, chat_id, channel_id=None):
+    text = format_candle_message(candle)
+    await bot.send_message(chat_id=chat_id, text=text, parse_mode=ParseMode.HTML)
+    if channel_id:
+        await bot.send_message(chat_id=channel_id, text=text, parse_mode=ParseMode.HTML)
+
+def create_keyboards():
+    """Создает клавиатуры для бота"""
+    from telegram import InlineKeyboardButton, InlineKeyboardMarkup
+    
+    def main_menu():
+        keyboard = [
+            [InlineKeyboardButton("Обновить", callback_data="refresh")]
+        ]
+        return InlineKeyboardMarkup(keyboard)
+    
+    return type('obj', (object,), {
+        'main_menu': main_menu
+    })
+```
+
+main.py
+
+```python
+import os
+import asyncio
+import ccxt
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (ApplicationBuilder, CommandHandler,
+                          CallbackQueryHandler, ContextTypes)
+
+from core import get_significant_candles, send_message_about_candle, SYMBOLS, create_keyboards
+
+# === Загрузка переменных окружения ===
+load_dotenv()
+BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+CHANNEL_ID = os.getenv("TELEGRAM_CHANNEL_ID")  # Например: -1001234567890
+BYBIT_API_KEY = os.getenv("BYBIT_API_KEY", "")
+BYBIT_API_SECRET = os.getenv("BYBIT_API_SECRET", "")
+CHECK_INTERVAL = 60  # Увеличили интервал для Termux
+
+user_settings = {}
+DEFAULT_TIMEFRAME = '15m'
+
+# Инициализация биржи
+exchange = ccxt.bybit({
+    'apiKey': BYBIT_API_KEY,
+    'secret': BYBIT_API_SECRET,
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'swap',
+        'adjustForTimeDifference': True,
+        'recvWindow': 10000,
+    },
+    'timeout': 30000,
+})
+
+# === Команды ===
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    keyboards = create_keyboards()
+    await update.message.reply_text(
+        text="📊 Бот запущен. Выберите действие:",
+        reply_markup=keyboards.main_menu()
+    )
+
+async def handle_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()
+    data = query.data
+
+    if data == "refresh":
+        keyboards = create_keyboards()
+        await query.edit_message_text(
+            text="♻️ Обновлено",
+            reply_markup=keyboards.main_menu()
+        )
+
+# === Основная проверка рынка ===
+async def check_market_loop(app):
+    while True:
+        try:
+            for name, symbol in SYMBOLS.items():
+                tf = user_settings.get(symbol, DEFAULT_TIMEFRAME)
+                candles = await get_significant_candles(exchange, symbol, tf)
+                if candles:
+                    last = candles[-1]
+                    await send_message_about_candle(app.bot, last, CHAT_ID, CHANNEL_ID)
+            await asyncio.sleep(CHECK_INTERVAL)
+        except Exception as e:
+            print(f"Ошибка в check_market_loop: {e}")
+            await asyncio.sleep(60)  # Пауза при ошибке
+
+# === Запуск ===
+def run():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CallbackQueryHandler(handle_button))
+
+    async def on_start(app):
+        await app.bot.send_message(chat_id=CHAT_ID, text="🚀 Бот активен в Termux")
+        asyncio.create_task(check_market_loop(app))
+
+    app.post_init = on_start
+    print("✅ Бот запущен в Termux")
+    app.run_polling()
+
+if __name__ == "__main__":
+    run()
+```
+
+.env файл (пример)
+
+```
+TELEGRAM_BOT_TOKEN=your_telegram_bot_token_here
+TELEGRAM_CHAT_ID=your_chat_id_here
+TELEGRAM_CHANNEL_ID=your_channel_id_here
+BYBIT_API_KEY=your_bybit_api_key_here
+BYBIT_API_SECRET=your_bybit_api_secret_here
+```
+
+Инструкция по установке в Termux
+
+1. Обновите пакеты и установите Python:
+
+```bash
+pkg update
+pkg upgrade
+pkg install python python-dev libjpeg-turbo libcrypt ndk-sysroot clang
+```
+
+1. Установите необходимые Python-пакеты:
+
+```bash
+pip install ccxt python-telegram-bot python-dotenv
+```
+
+1. Создайте директорию для проекта и перейдите в нее:
+
+```bash
+mkdir CandleMonitor
+cd CandleMonitor
+```
+
+1. Создайте файлы проекта:
+
+```bash
+nano core.py
+# Вставьте содержимое core.py и сохраните (Ctrl+X, затем Y, затем Enter)
+
+nano main.py
+# Вставьте содержимое main.py и сохраните
+
+nano .env
+# Вставьте содержимое .env с вашими реальными ключами
+```
+
+1. Сделайте файлы исполняемыми:
+
+```bash
+chmod +x main.py
+```
+
+1. Запустите бота:
+
+```bash
+python main.py
+```
+
+Для работы в фоне в Termux
+
+1. Установите tmux:
+
+```bash
+pkg install tmux
+```
+
+1. Запустите бота в сессии tmux:
+
+```bash
+tmux new-session -s bot
+python main.py
+# Нажмите Ctrl+B, затем D для отсоединения от сессии
+```
+
+1. Чтобы вернуться к сессии:
+
+```bash
+tmux attach-session -t bot
+```
+
+1. Чтобы остановить бота:
+
+```bash
+# В сессии tmux нажмите Ctrl+C
+# Или найдите процесс и завершите его:
+pkill -f "python main.py"
+```
+
+Особенности для Termux
+
+· Увеличены интервалы проверки для экономии ресурсов
+· Уменьшено количество символов для мониторинга
+· Добавлена расширенная обработка ошибок
+· Увеличены таймауты для сетевых запросов
+· Добавлена синхронизация времени для Bybit API
+
+Этот код оптимизирован для работы на Android устройствах через Termux и включает все необходимые зависимости и настройки.
