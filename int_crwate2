@@ -1,0 +1,353 @@
+pkg update
+pkg upgrade
+pkg install python clang libffi libjpeg-turbo libcrypt
+pip install pandas numpy ccxt openpyxl
+
+
+import pandas as pd
+import numpy as np
+import ccxt
+import time
+from datetime import datetime, timedelta
+import os
+
+# Создаем папку для результатов
+if not os.path.exists('trading_results'):
+    os.makedirs('trading_results')
+
+# Настройки
+SYMBOLS = ['SOL/USDT:USDT', 'ADA/USDT:USDT', 'ETH/USDT:USDT', 
+           'SUI/USDT:USDT', 'JUP/USDT:USDT', 'SEI/USDT:USDT', 'BNB/USDT:USDT']
+TIMEFRAME = '15m'
+MONTHS_BACK = 3  # Уменьшили до 3 месяцев
+MIN_PERCENT_CHANGE = 1.67
+POSITION_SIZE = 50  # USDT
+LEVERAGE = 10
+COMMISSION_RATE = 0.001  # 0.1% комиссия
+
+# Инициализация биржи
+exchange = ccxt.bybit({
+    'enableRateLimit': True,
+    'options': {
+        'defaultType': 'swap',
+        'adjustForTimeDifference': True,
+    },
+})
+
+def calculate_levels(open_price, high_price, low_price, close_price):
+    """Расчет уровней A, C, D, F"""
+    is_green = close_price >= open_price
+    
+    if is_green:
+        A = high_price   # Верхняя тень
+        C = close_price  # Закрытие (верх тела)
+    else:
+        A = low_price    # Нижняя тень
+        C = open_price   # Открытие (верх тела)
+    
+    size = abs(A - C)
+    D = C + size
+    F = A - size
+    
+    return A, C, D, F, size
+
+def fetch_historical_data(symbol, timeframe, months_back):
+    """Получение исторических данных"""
+    since = exchange.parse8601((datetime.now() - timedelta(days=30*months_back)).strftime('%Y-%m-%d %H:%M:%S'))
+    ohlcv = exchange.fetch_ohlcv(symbol, timeframe, since)
+    df = pd.DataFrame(ohlcv, columns=['timestamp', 'open', 'high', 'low', 'close', 'volume'])
+    df['timestamp'] = pd.to_datetime(df['timestamp'], unit='ms')
+    df.set_index('timestamp', inplace=True)
+    return df
+
+def backtest_strategy(df, symbol):
+    """Бэктестинг стратегии"""
+    trades = []
+    
+    # Находим значительные свечи
+    df['change'] = (df['close'] - df['open']) / df['open'] * 100
+    significant_candles = df[abs(df['change']) >= MIN_PERCENT_CHANGE].copy()
+    
+    # Рассчитываем уровни для значительных свечей
+    for idx, row in significant_candles.iterrows():
+        A, C, D, F, size = calculate_levels(row['open'], row['high'], row['low'], row['close'])
+        significant_candles.loc[idx, 'A'] = A
+        significant_candles.loc[idx, 'C'] = C
+        significant_candles.loc[idx, 'D'] = D
+        significant_candles.loc[idx, 'F'] = F
+        significant_candles.loc[idx, 'size'] = size
+        
+        # Определяем тип сделки (лонг/шорт)
+        trade_type = 'LONG' if row['change'] >= 0 else 'SHORT'
+        significant_candles.loc[idx, 'type'] = trade_type
+        
+        # Находим точку входа (последующее касание D/F)
+        future_data = df[df.index > idx].head(100)  # Смотрим на 100 свечей вперед
+        
+        if trade_type == 'LONG':
+            # Для лонга ищем касание уровня F
+            entry_condition = future_data['low'] <= F
+            if entry_condition.any():
+                entry_idx = future_data[entry_condition].index[0]
+                entry_price = future_data.loc[entry_idx, 'low']
+                
+                # Рассчитываем тейк-профиты для лонга: A → C → D
+                tp1 = A
+                tp2 = C
+                tp3 = D
+                
+                # Рассчитываем стоп-лоссы
+                stop1 = entry_price * 0.8  # -20%
+                
+                # Оптимизируем stop2 в диапазоне 1.4-1.67%
+                best_stop2 = None
+                best_pnl = -float('inf')
+                
+                for stop_percent in np.arange(1.4, 1.67, 0.01):
+                    stop2 = entry_price * (1 - stop_percent/100)
+                    
+                    # Симуляция сделки
+                    pnl = simulate_trade(
+                        future_data, entry_idx, entry_price, 
+                        'LONG', stop1, stop2, tp1, tp2, tp3
+                    )
+                    
+                    if pnl > best_pnl:
+                        best_pnl = pnl
+                        best_stop2 = stop2
+                
+                # Фиксируем сделку
+                trade = {
+                    'symbol': symbol,
+                    'candle_time': idx,
+                    'type': trade_type,
+                    'A': A,
+                    'C': C,
+                    'D': D,
+                    'F': F,
+                    'entry': entry_price,
+                    'stop1': stop1,
+                    'stop2': best_stop2,
+                    'tp1': tp1,
+                    'tp2': tp2,
+                    'tp3': tp3,
+                    'position_size': POSITION_SIZE * LEVERAGE / entry_price,
+                    'commission': POSITION_SIZE * COMMISSION_RATE * 2,  # Вход и выход
+                    'pnl': best_pnl,
+                    'result': 'WIN' if best_pnl > 0 else 'LOSS'
+                }
+                
+                trades.append(trade)
+        
+        else:  # SHORT
+            # Для шорта ищем касание уровня D
+            entry_condition = future_data['high'] >= D
+            if entry_condition.any():
+                entry_idx = future_data[entry_condition].index[0]
+                entry_price = future_data.loc[entry_idx, 'high']
+                
+                # Рассчитываем тейк-профиты для шорта: C → A → F
+                tp1 = C
+                tp2 = A
+                tp3 = F
+                
+                # Рассчитываем стоп-лоссы
+                stop1 = entry_price * 1.2  # +20%
+                
+                # Оптимизируем stop2 в диапазоне 1.4-1.67%
+                best_stop2 = None
+                best_pnl = -float('inf')
+                
+                for stop_percent in np.arange(1.4, 1.67, 0.01):
+                    stop2 = entry_price * (1 + stop_percent/100)
+                    
+                    # Симуляция сделки
+                    pnl = simulate_trade(
+                        future_data, entry_idx, entry_price, 
+                        'SHORT', stop1, stop2, tp1, tp2, tp3
+                    )
+                    
+                    if pnl > best_pnl:
+                        best_pnl = pnl
+                        best_stop2 = stop2
+                
+                # Фиксируем сделку
+                trade = {
+                    'symbol': symbol,
+                    'candle_time': idx,
+                    'type': trade_type,
+                    'A': A,
+                    'C': C,
+                    'D': D,
+                    'F': F,
+                    'entry': entry_price,
+                    'stop1': stop1,
+                    'stop2': best_stop2,
+                    'tp1': tp1,
+                    'tp2': tp2,
+                    'tp3': tp3,
+                    'position_size': POSITION_SIZE * LEVERAGE / entry_price,
+                    'commission': POSITION_SIZE * COMMISSION_RATE * 2,  # Вход и выход
+                    'pnl': best_pnl,
+                    'result': 'WIN' if best_pnl > 0 else 'LOSS'
+                }
+                
+                trades.append(trade)
+    
+    return pd.DataFrame(trades)
+
+def simulate_trade(data, entry_idx, entry_price, trade_type, stop1, stop2, tp1, tp2, tp3):
+    """Симуляция торговой сделки"""
+    # Выделяем данные после входа
+    trade_data = data[data.index >= entry_idx].copy()
+    
+    # Инициализируем переменные сделки
+    exit_price = None
+    exit_reason = None
+    
+    # Разбиваем позицию на 3 части
+    position_parts = 3
+    part_size = POSITION_SIZE * LEVERAGE / position_parts
+    
+    # Симулируем каждую часть позиции
+    total_pnl = 0
+    
+    for i in range(position_parts):
+        # Определяем тейк-профит для этой части
+        if i == 0:
+            tp = tp1
+        elif i == 1:
+            tp = tp2
+        else:
+            tp = tp3
+        
+        # Симулируем ценовое движение
+        for idx, row in trade_data.iterrows():
+            current_low = row['low']
+            current_high = row['high']
+            current_close = row['close']
+            
+            # Проверяем условия выхода
+            if trade_type == 'LONG':
+                # Проверяем тейк-профит
+                if current_high >= tp:
+                    exit_price = tp
+                    exit_reason = f'TP{i+1}'
+                    break
+                
+                # Проверяем стоп-лосс
+                if current_low <= stop1:
+                    exit_price = stop1
+                    exit_reason = 'STOP1'
+                    break
+                    
+                if current_low <= stop2:
+                    exit_price = stop2
+                    exit_reason = 'STOP2'
+                    break
+            
+            else:  # SHORT
+                # Проверяем тейк-профит
+                if current_low <= tp:
+                    exit_price = tp
+                    exit_reason = f'TP{i+1}'
+                    break
+                
+                # Проверяем стоп-лосс
+                if current_high >= stop1:
+                    exit_price = stop1
+                    exit_reason = 'STOP1'
+                    break
+                    
+                if current_high >= stop2:
+                    exit_price = stop2
+                    exit_reason = 'STOP2'
+                    break
+        
+        # Рассчитываем PnL для этой части
+        if trade_type == 'LONG':
+            pnl = (exit_price - entry_price) / entry_price * 100
+        else:
+            pnl = (entry_price - exit_price) / entry_price * 100
+        
+        # Вычитаем комиссию
+        pnl -= COMMISSION_RATE * 2 * 100  # Комиссия в процентах
+        
+        total_pnl += pnl * (part_size / (POSITION_SIZE * LEVERAGE))
+    
+    return total_pnl
+
+def create_excel_report(all_trades):
+    """Создание Excel-отчета"""
+    with pd.ExcelWriter('trading_results/backtest_report.xlsx') as writer:
+        # Лист с описанием стратегии
+        description_data = {
+            'Параметр': ['Таймфрейм', 'Период', 'Минимальное изменение', 'Размер позиции', 'Плечо', 'Комиссия'],
+            'Значение': [TIMEFRAME, f'{MONTHS_BACK} месяцев', f'{MIN_PERCENT_CHANGE}%', 
+                        f'{POSITION_SIZE} USDT', LEVERAGE, f'{COMMISSION_RATE*100}%']
+        }
+        
+        description_df = pd.DataFrame(description_data)
+        description_df.to_excel(writer, sheet_name='Описание', index=False)
+        
+        # Листы для каждой пары
+        for symbol in SYMBOLS:
+            symbol_trades = all_trades[all_trades['symbol'] == symbol]
+            symbol_trades.to_excel(writer, sheet_name=symbol.split('/')[0], index=False)
+        
+        # Сводный лист
+        summary_data = []
+        for symbol in SYMBOLS:
+            symbol_trades = all_trades[all_trades['symbol'] == symbol]
+            if len(symbol_trades) > 0:
+                win_rate = len(symbol_trades[symbol_trades['result'] == 'WIN']) / len(symbol_trades) * 100
+                avg_pnl = symbol_trades['pnl'].mean()
+                total_pnl = symbol_trades['pnl'].sum()
+                
+                summary_data.append({
+                    'Пара': symbol.split('/')[0],
+                    'Количество сделок': len(symbol_trades),
+                    'Win Rate': f'{win_rate:.2f}%',
+                    'Средний PnL': f'{avg_pnl:.2f}%',
+                    'Общий PnL': f'{total_pnl:.2f}%'
+                })
+        
+        summary_df = pd.DataFrame(summary_data)
+        summary_df.to_excel(writer, sheet_name='Сводка', index=False)
+
+# Основная функция
+def main():
+    all_trades = pd.DataFrame()
+    
+    print("Начинаем сбор данных и бэктестинг...")
+    
+    for symbol in SYMBOLS:
+        print(f"Обрабатываем {symbol}...")
+        
+        try:
+            # Получаем исторические данные
+            df = fetch_historical_data(symbol, TIMEFRAME, MONTHS_BACK)
+            
+            # Бэктестим стратегию
+            trades_df = backtest_strategy(df, symbol)
+            
+            # Добавляем к общим результатам
+            all_trades = pd.concat([all_trades, trades_df], ignore_index=True)
+            
+            print(f"Найдено {len(trades_df)} сделок для {symbol}")
+            
+        except Exception as e:
+            print(f"Ошибка при обработке {symbol}: {e}")
+        
+        # Пауза между запросами
+        time.sleep(1)
+    
+    # Создаем Excel-отчет
+    if not all_trades.empty:
+        create_excel_report(all_trades)
+        print("Отчет успешно создан: trading_results/backtest_report.xlsx")
+    else:
+        print("Не найдено подходящих сделок для отчета")
+
+if __name__ == "__main__":
+    main()
